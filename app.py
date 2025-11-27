@@ -1,217 +1,1673 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-import joblib
+# app.py
+# AI Powered Real-Time Fraud Detection
+# - UI aligned by channel & transaction type
+# - Home city/country vs transaction city/country rules
+# - Time-of-day + amount rules
+# - ML & Rules justification block
+# - Response time per transaction
+# - Example “good” & “fraud” transactions per channel
+# - Inline comments for KT
+# - New channels: Debit Card, Other
+# - Bank renamed to "Onsite Branch Transaction"
+# - New beneficiary / known beneficiary impact on ML score
+# - New ML label mapping based on 0–100 scores
+
+import datetime
+import time  # used for response-time measurement
+from math import radians, sin, cos, asin, sqrt
 from pathlib import Path
+from typing import Dict, List, Tuple
 
-# ==============================
-# 1. Load artifacts (cached)
-# ==============================
+import joblib
+import pandas as pd
+import streamlit as st
 
+# -------------------------
+# CONFIGURATION
+# -------------------------
+INR_PER_UNIT = {
+    "INR": 1.0,
+    "USD": 83.2,
+    "EUR": 90.5,
+    "GBP": 105.3,
+    "AED": 22.7,
+    "AUD": 61.0,
+    "SGD": 61.5,
+}
+CURRENCIES = list(INR_PER_UNIT.keys())
+DEFAULT_CURRENCY = "INR"
+
+BASE_THRESHOLDS_INR = {
+    "absolute_crit_amount": 10_000_000,
+    "high_amount_threshold": 2_000_000,
+    "medium_amount_threshold": 100_000,
+    "atm_high_withdrawal": 300_000,
+    "card_test_small_amount_inr": 200,
+}
+
+SEVERITY_ORDER = {"LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
+
+CHANNEL_TXN_TYPES = {
+    "atm": ["CASH_WITHDRAWAL", "TRANSFER"],
+    "credit card": ["PAYMENT", "REFUND"],
+    "debit card": ["PAYMENT", "REFUND"],
+    "mobile app": ["PAYMENT", "TRANSFER", "BILL_PAY"],
+    "pos": ["PAYMENT"],
+    "online purchase": ["PAYMENT"],
+    "onsite branch transaction": ["DEPOSIT", "TRANSFER", "WITHDRAWAL"],
+    "netbanking": ["TRANSFER", "BILL_PAY", "PAYMENT"],
+    "other": ["PAYMENT", "TRANSFER", "BILL_PAY"],
+}
+
+# Placeholder model performance metrics
+MODEL_PERFORMANCE = {
+    "overall": {
+        "roc_auc": None,
+        "accuracy": None,
+        "precision": None,
+        "recall": None,
+    },
+    "channels": {
+        "atm": {"accuracy": None, "precision": None, "recall": None},
+        "credit card": {"accuracy": None, "precision": None, "recall": None},
+        "debit card": {"accuracy": None, "precision": None, "recall": None},
+        "mobile app": {"accuracy": None, "precision": None, "recall": None},
+        "pos": {"accuracy": None, "precision": None, "recall": None},
+        "online purchase": {"accuracy": None, "precision": None, "recall": None},
+        "onsite branch transaction": {"accuracy": None, "precision": None, "recall": None},
+        "netbanking": {"accuracy": None, "precision": None, "recall": None},
+        "other": {"accuracy": None, "precision": None, "recall": None},
+    },
+}
+
+
+def build_example_transactions() -> pd.DataFrame:
+    """
+    Build a small synthetic table of example transactions per channel.
+    These are illustrative only – not from the real model.
+    """
+    rows = []
+    for channel_name, txn_types in CHANNEL_TXN_TYPES.items():
+        # 5 good + 5 fraud examples per channel
+        for i in range(5):
+            rows.append(
+                {
+                    "channel": channel_name,
+                    "example_type": "GOOD",
+                    "transaction_type": txn_types[i % len(txn_types)],
+                    "amount_in_inr": 5_000 + i * 2_000,
+                    "fraud_confidence_ml_pct": 5 + i * 3,  # illustrative
+                    "anomaly_score_ml_pct": 5 + i * 2,
+                    "rules_risk": "LOW",
+                    "final_risk": "LOW",
+                }
+            )
+        for i in range(5):
+            rows.append(
+                {
+                    "channel": channel_name,
+                    "example_type": "FRAUD",
+                    "transaction_type": txn_types[i % len(txn_types)],
+                    "amount_in_inr": 200_000 + i * 500_000,
+                    "fraud_confidence_ml_pct": 60 + i * 8,
+                    "anomaly_score_ml_pct": 40 + i * 5,
+                    "rules_risk": "HIGH" if i < 3 else "CRITICAL",
+                    "final_risk": "HIGH" if i < 3 else "CRITICAL",
+                }
+            )
+    df = pd.DataFrame(rows)
+    return df
+
+
+EXAMPLE_TXNS_DF = build_example_transactions()
+
+# -------------------------
+# HELPERS
+# -------------------------
+
+
+def inr_to_currency(amount_in_inr: float, currency: str) -> float:
+    if currency not in INR_PER_UNIT or INR_PER_UNIT[currency] == 0:
+        return amount_in_inr
+    return amount_in_inr / INR_PER_UNIT[currency]
+
+
+def normalize_score(x: float, min_val: float = 0.0, max_val: float = 0.02) -> float:
+    """
+    Normalize an ML score into a 0–100 range for business interpretability.
+
+    For fraud probability:
+      - We assume most interesting values are in [0, 0.02] (0%–2%),
+      - 0 => 0, 0.02 => 100.
+    For anomaly score use a larger max_val, e.g. 0.10.
+    """
+    if x is None:
+        return 0.0
+    try:
+        val = float(x)
+    except Exception:
+        return 0.0
+    if val < min_val:
+        val = min_val
+    if val > max_val:
+        val = max_val
+    if max_val == min_val:
+        return 0.0
+    return (val - min_val) / (max_val - min_val) * 100.0
+
+
+def haversine_km(lat1, lon1, lat2, lon2) -> float:
+    """Geo distance used for impossible-travel rules."""
+    if None in (lat1, lon1, lat2, lon2):
+        return None
+    lat1, lon1, lat2, lon2 = map(radians, (lat1, lon1, lat2, lon2))
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = sin(dlat / 2) ** 2 + cos(lat1) * cos(lat2) * sin(dlon / 2) ** 2
+    c = 2 * asin(sqrt(a))
+    return 6371 * c
+
+
+def escalate(a: str, b: str) -> str:
+    """Return the higher risk between two severities."""
+    return a if SEVERITY_ORDER[a] >= SEVERITY_ORDER[b] else b
+
+
+# -------------------------
+# ML MODEL LOADING
+# -------------------------
 @st.cache_resource
-def load_artifacts():
+def load_models():
     models_dir = Path("models")
 
-    preprocess_pipeline = joblib.load(models_dir / "preprocess_pipeline.joblib")
-    imputer            = joblib.load(models_dir / "post_preprocess_imputer.joblib")
-    lgbm_model         = joblib.load(models_dir / "lightgbm.joblib")
-    iso_model          = joblib.load(models_dir / "isolation_forest.joblib")
+    def _load(name: str):
+        path = models_dir / name
+        try:
+            return joblib.load(path)
+        except Exception as e:
+            st.error(f"Error loading model artifact: {name}")
+            st.exception(e)
+            raise
 
-    return preprocess_pipeline, imputer, lgbm_model, iso_model
-
-
-preprocess_pipeline, imputer, lgbm_model, iso_model = load_artifacts()
-
-# ==============================
-# 2. Risk thresholds & logic
-# ==============================
-
-# LightGBM thresholds from your validation search
-FRAUD_MED  = 0.00005
-FRAUD_HIGH = 0.00023328
-FRAUD_CRIT = 0.01732857
-
-# Isolation Forest thresholds (tuned)
-ANOM_MED   = 0.04      # mild anomaly
-ANOM_HIGH  = 0.05      # stronger anomaly
-ANOM_CRIT  = 0.08      # extreme anomaly
+    supervised = None
+    iforest = None
+    try:
+        supervised = _load("supervised_lgbm_pipeline.joblib")
+    except Exception:
+        supervised = None
+    try:
+        iforest = _load("iforest_pipeline.joblib")
+    except Exception:
+        iforest = None
+    return supervised, iforest
 
 
-def risk_from_scores(fraud_prob: float, anomaly_score: float) -> str:
+supervised_pipeline, iforest_pipeline = load_models()
+
+# -------------------------
+# ML SCORING WRAPPER
+# -------------------------
+
+
+def ml_risk_label(fraud_score: float, anomaly_score: float) -> str:
     """
-    Combined rule:
-    - CRITICAL: either model extremely suspicious
-    - HIGH: fraud_prob clearly high OR (moderate fraud_prob + strong anomaly)
-    - MEDIUM: any moderate signal from either model
-    - LOW: everything looks calm
+    Map normalized ML scores (0–100) into LOW / MEDIUM / HIGH / CRITICAL.
+
+    Business mapping:
+    0–30   => LOW
+    30–60  => MEDIUM
+    60–90  => HIGH
+    90–100 => CRITICAL
+
+    Uses the maximum of fraud and anomaly scores.
     """
-    if fraud_prob >= FRAUD_CRIT or anomaly_score >= ANOM_CRIT:
+    agg = max(fraud_score, anomaly_score)
+    if agg >= 90.0:
         return "CRITICAL"
-    elif fraud_prob >= FRAUD_HIGH or (fraud_prob >= FRAUD_MED and anomaly_score >= ANOM_HIGH):
+    if agg >= 60.0:
         return "HIGH"
-    elif fraud_prob >= FRAUD_MED or anomaly_score >= ANOM_MED:
+    if agg >= 30.0:
         return "MEDIUM"
-    else:
-        return "LOW"
+    return "LOW"
 
 
-def score_transaction(input_dict: dict):
+def score_transaction_ml(
+    model_pipeline,
+    iforest_pipeline,
+    model_payload: Dict,
+    convert_to_inr: bool = False,
+    currency: str = "INR",
+) -> Tuple[float, float, float, float, str]:
     """
-    input_dict must contain the final feature columns used in training:
-    Amount, TransactionType, Location, DeviceID, Channel, hour, day_of_week, month
+    Core ML scoring wrapper used by the UI.
+    Returns:
+      fraud_prob_raw   (0–1 probability from supervised model)
+      anomaly_raw      (raw anomaly magnitude)
+      fraud_score_0_100
+      anomaly_score_0_100
+      ml_risk_label
+
+    Fraud score is adjusted based on beneficiary flags (Balanced Option B):
+      new_beneficiary=True  -> +10
+      known_beneficiary=True -> -5
     """
-    df = pd.DataFrame([input_dict])
+    amt_for_model = model_payload.get("Amount", 0.0)
+    if convert_to_inr:
+        amt_for_model = amt_for_model * INR_PER_UNIT.get(currency, 1.0)
 
-    # 1) Preprocess
-    X_prep = preprocess_pipeline.transform(df)
+    model_df = pd.DataFrame(
+        [
+            {
+                "Amount": amt_for_model,
+                "TransactionType": model_payload.get("TransactionType", "PAYMENT"),
+                "Location": model_payload.get("txn_city", "Unknown"),
+                "DeviceID": model_payload.get("DeviceID", "Unknown"),
+                "Channel": model_payload.get("Channel", "Other"),
+                "hour": model_payload.get("hour", 0),
+                "day_of_week": model_payload.get("day_of_week", 0),
+                "month": model_payload.get("month", 0),
+            }
+        ]
+    )
 
-    # 2) Impute
-    X_imp = imputer.transform(X_prep).astype(np.float32)
+    fraud_prob_raw = 0.0
+    anomaly_raw = 0.0
+    try:
+        if model_pipeline is not None:
+            fraud_prob_raw = float(model_pipeline.predict_proba(model_df)[0, 1])
+    except Exception as e:
+        st.error("Supervised model scoring error - check pipeline input schema")
+        st.exception(e)
+    try:
+        if iforest_pipeline is not None:
+            raw = float(iforest_pipeline.decision_function(model_df)[0])
+            anomaly_raw = -raw
+    except Exception as e:
+        st.error("IsolationForest scoring error - check pipeline input schema")
+        st.exception(e)
 
-    # 3) Supervised fraud probability (LightGBM)
-    fraud_prob = float(lgbm_model.predict_proba(X_imp)[0, 1])
+    # Normalize for interpretability (0–100)
+    fraud_score = normalize_score(fraud_prob_raw, min_val=0.0, max_val=0.02)
+    anomaly_score = normalize_score(anomaly_raw, min_val=0.0, max_val=0.10)
 
-    # 4) Unsupervised anomaly score (Isolation Forest)
-    anomaly_score = float(-iso_model.decision_function(X_imp)[0])  # higher = more anomalous
+    # Beneficiary-based adjustments (Balanced Option B)
+    new_beneficiary = bool(model_payload.get("new_beneficiary", False))
+    known_beneficiary = bool(model_payload.get("known_beneficiary", False))
 
-    # 5) Risk
-    risk = risk_from_scores(fraud_prob, anomaly_score)
+    if new_beneficiary:
+        fraud_score += 10.0
+    if known_beneficiary:
+        fraud_score -= 5.0
 
-    return fraud_prob, anomaly_score, risk
+    # Clamp 0–100
+    fraud_score = max(0.0, min(100.0, fraud_score))
+
+    label = ml_risk_label(fraud_score, anomaly_score)
+    return fraud_prob_raw, anomaly_raw, fraud_score, anomaly_score, label
 
 
-# ==============================
-# 3. Streamlit UI
-# ==============================
+# -------------------------
+# RULE ENGINE
+# -------------------------
 
+def evaluate_rules(payload: Dict, currency: str) -> Tuple[List[Dict], str]:
+    """
+    Deterministic rule engine.
+    Returns a list of triggered rules and the highest severity across rules.
+    """
+    ABS_CRIT = inr_to_currency(BASE_THRESHOLDS_INR["absolute_crit_amount"], currency)
+    HIGH_AMT = inr_to_currency(BASE_THRESHOLDS_INR["high_amount_threshold"], currency)
+    MED_AMT = inr_to_currency(BASE_THRESHOLDS_INR["medium_amount_threshold"], currency)
+    ATM_HIGH = inr_to_currency(BASE_THRESHOLDS_INR["atm_high_withdrawal"], currency)
+    CARD_TEST_SMALL = inr_to_currency(BASE_THRESHOLDS_INR["card_test_small_amount_inr"], currency)
+
+    rules: List[Dict] = []
+
+    amt = float(payload.get("Amount", 0.0) or 0.0)
+    channel_raw = str(payload.get("Channel", "") or "")
+    channel = channel_raw.lower()
+    hour = int(payload.get("hour", 0) or 0)
+    monthly_avg = float(payload.get("monthly_avg", 0.0) or 0.0)
+    rolling_avg_7d = float(payload.get("rolling_avg_7d", 0.0) or 0.0)
+    txns_1h = int(payload.get("txns_last_1h", 0) or 0)
+    txns_24h = int(payload.get("txns_last_24h", 0) or 0)
+    txns_7d = int(payload.get("txns_last_7d", 0) or 0)
+    failed_logins = int(payload.get("failed_login_attempts", 0) or 0)
+    new_benef = bool(payload.get("new_beneficiary", False))
+
+    ip_country = str(payload.get("ip_country", "") or "").lower()
+    declared_country = str(payload.get("declared_country", "") or "").lower()
+
+    home_city = str(payload.get("home_city", "") or "").lower()
+    home_country = str(payload.get("home_country", "") or "").lower()
+    txn_city = str(payload.get("txn_city", "") or "").lower()
+    txn_country = str(payload.get("txn_country", "") or "").lower()
+
+    last_device = str(payload.get("device_last_seen", "") or "").lower()
+    curr_device = str(payload.get("DeviceID", "") or "").lower()
+
+    last_lat = payload.get("last_known_lat")
+    last_lon = payload.get("last_known_lon")
+    txn_lat = payload.get("txn_lat")
+    txn_lon = payload.get("txn_lon")
+    atm_distance_km = float(payload.get("atm_distance_km", 0.0) or 0.0)
+
+    card_country = str(payload.get("card_country", "") or "").lower()
+    cvv_provided = payload.get("cvv_provided", True)
+    shipping_addr = payload.get("shipping_address", "")
+    billing_addr = payload.get("billing_address", "")
+    beneficiaries_added_24h = int(payload.get("beneficiaries_added_24h", 0) or 0)
+    suspicious_ip_flag = payload.get("suspicious_ip_flag", False)
+    card_small_attempts = int(payload.get("card_small_attempts_in_5min", 0) or 0)
+    pos_repeat_count = int(payload.get("pos_repeat_count", 0) or 0)
+    beneficiary_added_minutes = int(payload.get("beneficiary_added_minutes", 9999) or 9999)
+
+    known_beneficiary = bool(payload.get("known_beneficiary", False))
+
+    id_type = str(payload.get("id_type", "") or "").strip()
+    id_number = str(payload.get("id_number", "") or "").strip()
+
+    def add_rule(name: str, sev: str, detail: str):
+        rules.append({"name": name, "severity": sev, "detail": detail})
+
+    # 1) Absolute large amount
+    if amt >= ABS_CRIT:
+        add_rule(
+            "Absolute very large amount",
+            "CRITICAL",
+            f"Amount {amt:.2f} {currency} >= critical {ABS_CRIT:.2f} {currency}.",
+        )
+
+    # 2) Impossible travel based on geo-coordinates
+    impossible_travel_distance = None
+    if last_lat is not None and last_lon is not None and txn_lat is not None and txn_lon is not None:
+        impossible_travel_distance = haversine_km(last_lat, last_lon, txn_lat, txn_lon)
+
+    device_checks_enabled = channel not in ("onsite branch transaction", "atm")
+
+    if device_checks_enabled:
+        device_new = (not last_device) or last_device == "" or (curr_device and curr_device != last_device)
+        location_changed = impossible_travel_distance is not None and impossible_travel_distance > 500
+        if device_new and location_changed and amt > MED_AMT:
+            add_rule(
+                "New device + Impossible travel + High amount",
+                "CRITICAL",
+                f"New device + travel {impossible_travel_distance:.1f} km; amount {amt:.2f} {currency}.",
+            )
+
+    # 3) Multiple beneficiaries + high transfer
+    if beneficiaries_added_24h >= 3 and amt > HIGH_AMT:
+        add_rule(
+            "Multiple beneficiaries added + high transfer",
+            "CRITICAL",
+            f"{beneficiaries_added_24h} beneficiaries added and amount {amt:.2f} {currency}.",
+        )
+
+    # 4) Velocity rules
+    if txns_1h >= 10:
+        add_rule("High velocity (1h)", "HIGH", f"{txns_1h} txns in last 1 hour.")
+    if txns_24h >= 50:
+        add_rule("Very high velocity (24h)", "HIGH", f"{txns_24h} txns in last 24h.")
+
+    # 5) IP / declared mismatch (using home_country as declared)
+    if ip_country and declared_country and ip_country != declared_country:
+        sev = "HIGH" if amt > HIGH_AMT else "MEDIUM"
+        add_rule(
+            "IP / Declared country mismatch",
+            sev,
+            f"IP country '{ip_country}' differs from declared '{declared_country}'.",
+        )
+
+    # 6) Login security
+    if failed_logins >= 5:
+        add_rule("Multiple failed login attempts", "HIGH", f"{failed_logins} failed auth attempts.")
+
+    # 7) New beneficiary + amount
+    if new_benef and amt >= MED_AMT:
+        add_rule(
+            "New beneficiary + significant amount",
+            "HIGH",
+            "Transfer to newly added beneficiary with amount above threshold.",
+        )
+
+    # 8) IP flagged as risky
+    if suspicious_ip_flag and amt > (MED_AMT / 4):
+        add_rule("IP flagged by threat intelligence", "HIGH", "IP flagged and non-trivial amount.")
+
+    # 9) ATM distance from last known location
+    if channel == "atm" and atm_distance_km and atm_distance_km > 300:
+        add_rule("ATM distance from last location", "HIGH", f"ATM is {atm_distance_km:.1f} km away.")
+
+    # 10) Card issuing country mismatch vs home
+    if card_country and home_country and card_country != home_country and amt > MED_AMT:
+        add_rule(
+            "Card country mismatch vs home country",
+            "HIGH",
+            f"Card country {card_country} != home country {home_country}.",
+        )
+
+    # 11) Amount vs historical spending patterns
+    if monthly_avg > 0 and amt >= 5 * monthly_avg and amt > MED_AMT:
+        add_rule(
+            "Large spike vs monthly avg",
+            "HIGH",
+            f"Amount {amt:.2f} >= 5x monthly avg {monthly_avg:.2f}.",
+        )
+    elif rolling_avg_7d > 0 and amt >= 3 * rolling_avg_7d and amt > (MED_AMT / 2):
+        add_rule(
+            "Spike vs 7-day avg",
+            "MEDIUM",
+            f"Amount {amt:.2f} >= 3x 7-day avg {rolling_avg_7d:.2f}.",
+        )
+    elif monthly_avg > 0 and amt >= 2 * monthly_avg and amt > (MED_AMT / 2):
+        add_rule(
+            "Above monthly usual",
+            "MEDIUM",
+            f"Amount {amt:.2f} >= 2x monthly avg {monthly_avg:.2f}.",
+        )
+
+    # 12) Additional velocity
+    if txns_1h >= 5:
+        add_rule("Elevated velocity (1h)", "MEDIUM", f"{txns_1h} in last 1 hour.")
+    if 10 <= txns_24h < 50:
+        add_rule("Elevated velocity (24h)", "MEDIUM", f"{txns_24h} in last 24h.")
+
+    # 13) Time-of-day rules (unusual times)
+    if 0 <= hour <= 5 and monthly_avg < (MED_AMT * 2) and amt > (MED_AMT / 10):
+        add_rule(
+            "Late-night txn for low-activity customer",
+            "MEDIUM",
+            f"Txn at hour {hour} for low-activity customer; amt {amt:.2f}.",
+        )
+
+    if 0 <= hour <= 4 and amt >= HIGH_AMT:
+        add_rule(
+            "Very high amount during unusual time",
+            "HIGH",
+            f"Txn at hour {hour} with amount {amt:.2f} {currency} >= high threshold {HIGH_AMT:.2f}.",
+        )
+
+    # 14) Device new + low amount (benign)
+    if device_checks_enabled and ((not last_device) or last_device == "") and amt < (MED_AMT / 10):
+        add_rule("New device (low amount)", "LOW", "Transaction from new device but low amount.")
+
+    # 15) Recently added beneficiaries but not extreme
+    if 0 < beneficiaries_added_24h < 3:
+        add_rule("Beneficiaries recently added", "LOW", f"{beneficiaries_added_24h} beneficiaries added.")
+
+    # 16) Higher-risk countries based on transaction country
+    high_risk_countries = {"nigeria", "romania", "ukraine", "russia"}
+    if txn_country and txn_country in high_risk_countries:
+        add_rule(
+            "Transaction in higher-risk country",
+            "MEDIUM",
+            f"Transaction country flagged as higher-risk: {txn_country}.",
+        )
+
+    # 17) Card testing / micro-charges
+    if card_small_attempts >= 6 and CARD_TEST_SMALL > 0:
+        add_rule(
+            "Card testing / micro-charges detected",
+            "HIGH",
+            f"{card_small_attempts} small attempts; micro amount {CARD_TEST_SMALL:.2f} {currency}.",
+        )
+
+    # 18) Large ATM withdrawal
+    if channel == "atm" and amt >= ATM_HIGH:
+        add_rule(
+            "Large ATM withdrawal",
+            "HIGH",
+            f"ATM withdrawal {amt:.2f} {currency} >= {ATM_HIGH:.2f}",
+        )
+
+    # 19) POS repeat
+    if channel == "pos" and pos_repeat_count >= 15:
+        add_rule("POS heavy repeat transactions", "CRITICAL", f"{pos_repeat_count} rapid transactions at same POS.")
+    elif channel == "pos" and pos_repeat_count >= 10:
+        add_rule("POS repeat transactions", "HIGH", f"{pos_repeat_count} rapid transactions at same POS.")
+
+    # 20) Immediate transfer to just-added beneficiary (branch / netbanking)
+    if channel in ("netbanking", "onsite branch transaction") and beneficiary_added_minutes < 10 and amt >= MED_AMT:
+        add_rule(
+            "Immediate transfer to newly added beneficiary",
+            "HIGH",
+            f"Beneficiary added {beneficiary_added_minutes} minutes ago and transfer amount {amt:.2f} {currency}.",
+        )
+
+    # 21) Home vs transaction city/country
+    if home_country and txn_country and home_country != txn_country:
+        sev = "HIGH" if amt >= MED_AMT else "MEDIUM"
+        add_rule(
+            "Txn country differs from home country",
+            sev,
+            f"Home country '{home_country}' vs transaction country '{txn_country}'.",
+        )
+
+    if home_city and txn_city and home_city != txn_city and amt >= (MED_AMT / 2):
+        add_rule(
+            "Txn city differs from home city",
+            "MEDIUM",
+            f"Home city '{home_city}' vs transaction city '{txn_city}'.",
+        )
+
+    # 22) Transfer-specific structural checks
+    if str(payload.get("TransactionType", "")).upper() == "TRANSFER":
+        from_acc = payload.get("from_account_number")
+        to_acc = payload.get("to_account_number")
+        if not from_acc or not to_acc:
+            add_rule(
+                "Missing transfer account data",
+                "HIGH",
+                "Transfer missing source or destination account details.",
+            )
+
+    # 23) Branch channel: Missing identity
+    if channel == "onsite branch transaction":
+        if not id_type or not id_number:
+            add_rule(
+                "Missing customer identity at branch",
+                "CRITICAL",
+                "Onsite branch transaction without identity document details.",
+            )
+
+    # 24) Card-related channel-specific rules (credit / debit / online purchase)
+    if channel in ("credit card", "debit card", "online purchase"):
+        if not cvv_provided:
+            add_rule(
+                "Card-not-present without CVV",
+                "HIGH",
+                "Card used without CVV in a channel where CVV is expected.",
+            )
+        if shipping_addr and billing_addr and shipping_addr != billing_addr and amt > MED_AMT:
+            add_rule(
+                "Shipping / billing address mismatch",
+                "HIGH",
+                "Shipping and billing addresses differ for a high-value card transaction.",
+            )
+
+    # 25) Other channel: generic risk
+    if channel == "other":
+        if amt >= HIGH_AMT:
+            add_rule("Large transaction on 'Other' channel", "HIGH", f"High amount {amt:.2f} {currency}.")
+        if 0 <= hour <= 5 and amt > (MED_AMT / 2):
+            add_rule("Unusual time for 'Other' channel", "MEDIUM", f"Transaction at unusual hour {hour}.")
+
+    # Determine highest severity
+    highest = "LOW"
+    for r in rules:
+        highest = escalate(highest, r["severity"])
+
+    return rules, highest
+
+
+# -------------------------
+# Combine final risk
+# -------------------------
+
+def combine_final_risk(ml_risk: str, rule_highest: str) -> str:
+    """Final risk is the maximum of ML label and rules label."""
+    return escalate(ml_risk, rule_highest)
+
+
+# -------------------------
+# Explanation builder
+# -------------------------
+
+def build_explanation(
+    payload: Dict,
+    fraud_score: float,
+    anomaly_score: float,
+    ml_label: str,
+    rules_triggered: List[Dict],
+    final_risk: str,
+) -> List[str]:
+    """
+    Human-readable explanation bullets combining ML & rules,
+    used to justify scores for auditors / business.
+
+    fraud_score, anomaly_score are expected to be in 0–100 normalized range.
+    """
+    reasons = []
+
+    amt = float(payload.get("Amount", 0.0) or 0.0)
+    currency = payload.get("Currency", "INR")
+    channel = str(payload.get("Channel", "Unknown"))
+    channel_lower = channel.lower()
+    txn_type = str(payload.get("TransactionType", "Unknown"))
+    hour = int(payload.get("hour", 0) or 0)
+    monthly_avg = float(payload.get("monthly_avg", 0.0) or 0.0)
+    txn_city = payload.get("txn_city", "")
+    txn_country = payload.get("txn_country", "")
+    home_city = payload.get("home_city", "")
+    home_country = payload.get("home_country", "")
+
+    id_type = str(payload.get("id_type", "") or "").strip()
+    id_number = str(payload.get("id_number", "") or "").strip()
+
+    new_beneficiary = bool(payload.get("new_beneficiary", False))
+    known_beneficiary = bool(payload.get("known_beneficiary", False))
+
+    reasons.append(
+        f"ML model fraud risk score is {fraud_score:.1f} (0–100), anomaly risk score is {anomaly_score:.1f} (0–100), mapped to ML label **{ml_label}**."
+    )
+    reasons.append(
+        f"Deterministic rules evaluated this as **{final_risk}** after combining ML and rules."
+    )
+    reasons.append(
+        f"Transaction context: channel **{channel}**, type **{txn_type}**, amount **{amt:.2f} {currency}**, at hour **{hour}:00**."
+    )
+
+    if monthly_avg > 0 and amt > 2 * monthly_avg:
+        reasons.append(
+            f"Amount is significantly higher than customer's monthly average of ~{monthly_avg:.2f} {currency}."
+        )
+
+    if home_country and txn_country and home_country.lower() != txn_country.lower():
+        reasons.append(
+            f"Customer home country (**{home_country}**) is different from transaction country (**{txn_country}**)."
+        )
+    if home_city and txn_city and home_city.lower() != txn_city.lower():
+        reasons.append(
+            f"Customer home city (**{home_city}**) is different from transaction city (**{txn_city}**)."
+        )
+
+    if 0 <= hour <= 5:
+        reasons.append(
+            "Transaction took place during unusual hours (midnight to early morning), which increases fraud risk for large amounts."
+        )
+
+    if new_beneficiary:
+        reasons.append(
+            "Beneficiary was newly added before this transaction, which increases the fraud risk score."
+        )
+    if known_beneficiary:
+        reasons.append(
+            "Beneficiary is known/registered, which slightly reduces the fraud risk score compared to a brand new beneficiary."
+        )
+
+    if channel_lower == "onsite branch transaction" and (not id_type or not id_number):
+        reasons.append(
+            "Customer identity details (ID type/number) are missing for an onsite branch transaction, which is highly unusual and may indicate potential fraud."
+        )
+
+    if rules_triggered:
+        # Summarise most important rules
+        top_rules = sorted(
+            rules_triggered,
+            key=lambda r: SEVERITY_ORDER[r["severity"]],
+            reverse=True,
+        )[:3]
+        for r in top_rules:
+            reasons.append(f"Key rule fired: **{r['name']}** – {r['detail']}")
+
+    return reasons
+
+
+# -------------------------
+# STREAMLIT UI
+# -------------------------
 st.set_page_config(
-    page_title="Real-Time Fraud Detection Demo",
+    page_title="AI Powered Real-Time Fraud Detection",
     page_icon="💳",
     layout="centered",
 )
+st.title("💳 AI Powered Real-Time Fraud Detection")
 
-st.title("💳 Real-Time Fraud Detection Prototype")
-st.write(
-    "This demo uses a **supervised LightGBM model** and an **unsupervised Isolation Forest** "
-    "to assess the fraud risk of a single transaction in real time."
-)
+
+# Inline 4 fields: Currency, Amount, Date, Time
+col1, col2, col3, col4 = st.columns(4)
+with col1:
+    currency = st.selectbox(
+        "Select currency",
+        CURRENCIES,
+        index=CURRENCIES.index(DEFAULT_CURRENCY),
+        key="currency_select",
+        help="Currency in which the transaction is performed, e.g. INR / USD.",
+    )
+with col2:
+    amount = st.number_input(
+        "Transaction amount",
+        min_value=0.0,
+        value=1200.0,
+        step=10.0,
+        key="amount_common",
+        help="Total transaction amount in the selected currency.",
+    )
+with col3:
+    txn_date = st.date_input(
+        "Transaction date",
+        value=datetime.date.today(),
+        key="txn_date",
+        help="Calendar date on which the transaction is initiated.",
+    )
+with col4:
+    txn_time = st.time_input(
+        "Transaction time",
+        value=datetime.time(12, 0),
+        key="txn_time",
+        help="Local time of the transaction (24h clock).",
+    )
+
+# Combine for scoring
+txn_dt = datetime.datetime.combine(txn_date, txn_time)
+hour = txn_dt.hour
+day_of_week = txn_dt.weekday()
+month = txn_dt.month
 
 st.markdown("---")
-
-st.sidebar.header("⚙️ Configuration")
-
-st.sidebar.markdown(
-    """
-**How this works:**
-
-- We apply the **same preprocessing pipeline** used during training.
-- The **LightGBM model** outputs a fraud probability.
-- The **Isolation Forest** outputs an anomaly score.
-- A simple rule-engine combines both into a **risk level**:
-  - LOW / MEDIUM / HIGH / CRITICAL
-"""
+channel = st.selectbox(
+    "Transaction Channel",
+    [
+        "Choose...",
+        "Onsite Branch Transaction",
+        "Mobile App",
+        "ATM",
+        "Credit Card",
+        "Debit Card",
+        "POS",
+        "Online Purchase",
+        "NetBanking",
+        "Other",
+    ],
+    key="channel_select",
+    help="Where the transaction was initiated from.",
 )
+if channel and channel != "Choose...":
+    channel_lower = channel.lower()
+    st.markdown(f"### Channel: {channel}")
 
-st.header("🧾 Enter Transaction Details")
+    # Per-channel model metrics in sidebar
+    with st.sidebar:
+        st.markdown("### Channel Metrics")
+        ch_metrics = MODEL_PERFORMANCE["channels"].get(channel_lower, {})
+        if ch_metrics and any(v is not None for v in ch_metrics.values()):
+            if ch_metrics["accuracy"] is not None:
+                st.metric("Accuracy", f"{ch_metrics['accuracy'] * 100:.2f}%")
+            if ch_metrics["precision"] is not None:
+                st.metric("Precision", f"{ch_metrics['precision'] * 100:.2f}%")
+            if ch_metrics["recall"] is not None:
+                st.metric("Recall", f"{ch_metrics['recall'] * 100:.2f}%")
+        else:
+            st.caption("No per-channel metrics configured yet.")
 
-with st.form("txn_form"):
-    col1, col2 = st.columns(2)
-
-    with col1:
-        amount = st.number_input("Transaction Amount", min_value=0.0, value=1200.0, step=10.0)
-        txn_type = st.selectbox(
-            "Transaction Type",
-            ["PAYMENT", "TRANSFER", "DEBIT", "CREDIT", "CASH_OUT", "OTHER"],
-            index=0,
-        )
-        channel = st.selectbox(
-            "Channel",
-            ["Mobile", "NetBanking", "Online", "Card", "ATM", "Other"],
-            index=2,
-        )
-
-    with col2:
-        location = st.text_input("Location (City / Region)", value="Karachi")
-        device = st.selectbox(
-            "Device / OS",
-            ["Android", "iOS", "Windows", "Linux", "Other"],
-            index=0,
-        )
-        txn_datetime = st.datetime_input("Transaction Date & Time")
-
-    submitted = st.form_submit_button("🚀 Run Fraud Check")
-
-if submitted:
-    # Extract time features
-    hour = txn_datetime.hour
-    day_of_week = txn_datetime.weekday()  # 0 = Monday
-    month = txn_datetime.month
-
-    # Build payload
-    input_payload = {
-        "Amount": amount,
-        "TransactionType": txn_type,
-        "Location": location,
-        "DeviceID": device,
-        "Channel": channel,
-        "hour": hour,
-        "day_of_week": day_of_week,
-        "month": month,
-    }
-
-    with st.spinner("Scoring transaction..."):
-        fraud_prob, anomaly_score, risk = score_transaction(input_payload)
-
-    st.markdown("## 🔎 Results")
-
-    # Pretty risk badge
-    color_map = {
-        "LOW": "#2e7d32",       # green
-        "MEDIUM": "#f9a825",    # amber
-        "HIGH": "#f57c00",      # orange
-        "CRITICAL": "#c62828",  # red
-    }
-    risk_color = color_map.get(risk, "#607d8b")
-
-    st.markdown(
-        f"""
-        <div style="padding: 0.75rem 1rem; border-radius: 0.5rem;
-                    background-color: {risk_color}22; border: 1px solid {risk_color};">
-            <span style="font-size: 1.1rem; font-weight: 600; color: {risk_color};">
-                Risk Level: {risk}
-            </span>
-        </div>
-        """,
-        unsafe_allow_html=True,
+    txn_options = CHANNEL_TXN_TYPES.get(channel_lower, ["OTHER"])
+    txn_type = st.selectbox(
+        "Transaction type",
+        txn_options,
+        key=f"txn_type_{channel_lower}",
+        help="Functional nature of the transaction, e.g. TRANSFER, PAYMENT, BILL_PAY.",
     )
 
-    col_a, col_b = st.columns(2)
+    # Transaction-type specific panels: TRANSFER / PAYMENT / BILL_PAY
+    st.markdown("#### Transaction type details")
 
-    with col_a:
-        st.metric(
-            "Fraud Probability (LightGBM)",
-            f"{fraud_prob:.8f}",
-            help="Direct output probability from the supervised LightGBM model.",
+    transfer_fields = {}
+    payment_fields = {}
+    billpay_fields = {}
+
+    # TRANSFER UI
+    if str(txn_type).upper() == "TRANSFER":
+        st.subheader("TRANSFER — source and destination account details")
+        col_f1, col_f2 = st.columns(2)
+        with col_f1:
+            from_account_number = st.text_input(
+                "From account number",
+                key=f"from_acc_{channel_lower}",
+                help="Source account number for the transfer, e.g. 001234567890.",
+            )
+            from_account_holder_name = st.text_input(
+                "From account holder name",
+                key=f"from_name_{channel_lower}",
+                help="Name of the source account holder.",
+            )
+        with col_f2:
+            to_account_number = st.text_input(
+                "To account number",
+                key=f"to_acc_{channel_lower}",
+                help="Destination account number for the transfer.",
+            )
+            to_account_holder_name = st.text_input(
+                "To account holder name",
+                key=f"to_name_{channel_lower}",
+                help="Name of the destination account holder.",
+            )
+        known_beneficiary = st.checkbox(
+            "Is this to an existing/known beneficiary?",
+            value=False,
+            key=f"benef_flag_{channel_lower}",
+            help="Check if the beneficiary has been used previously.",
+        )
+        new_beneficiary = st.checkbox(
+            "Is this a newly added beneficiary?",
+            value=False,
+            key=f"new_benef_{channel_lower}",
+            help="Check if the beneficiary was added recently.",
+        )
+        beneficiary_added_minutes = st.number_input(
+            "Minutes since beneficiary added (if applicable)",
+            min_value=0,
+            value=9999,
+            step=1,
+            key=f"ben_min_{channel_lower}",
+            help="Use 9999 if beneficiary was not recently added.",
+        )
+        reason = st.text_area(
+            "Reason / notes (optional)",
+            key=f"transfer_reason_{channel_lower}",
+            help="Free-text comments, e.g. 'rent payment' or 'family support'.",
+        )
+        transfer_fields.update(
+            {
+                "from_account_number": from_account_number,
+                "from_account_holder_name": from_account_holder_name,
+                "to_account_number": to_account_number,
+                "to_account_holder_name": to_account_holder_name,
+                "new_beneficiary": new_beneficiary,
+                "known_beneficiary": known_beneficiary,
+                "beneficiary_added_minutes": int(beneficiary_added_minutes),
+                "reason": reason,
+            }
+        )
+    else:
+        # non-transfer, but we still want to support beneficiary flags where relevant
+        known_beneficiary = st.checkbox(
+            "Beneficiary is an existing/known beneficiary",
+            value=False,
+            key=f"benef_flag_{channel_lower}",
+            help="Tick if transaction is towards a known beneficiary.",
+        )
+        new_beneficiary = st.checkbox(
+            "Beneficiary was newly added",
+            value=False,
+            key=f"new_benef_{channel_lower}",
+            help="Tick if beneficiary was recently registered.",
+        )
+        beneficiary_added_minutes = st.number_input(
+            "Minutes since beneficiary added (if applicable)",
+            min_value=0,
+            value=9999,
+            step=1,
+            key=f"ben_min_{channel_lower}",
+            help="Use 9999 if not recently added.",
+        )
+        transfer_fields.update(
+            {
+                "new_beneficiary": new_beneficiary,
+                "known_beneficiary": known_beneficiary,
+                "beneficiary_added_minutes": int(beneficiary_added_minutes),
+            }
         )
 
-    with col_b:
-        st.metric(
-            "Anomaly Score (Isolation Forest)",
-            f"{anomaly_score:.5f}",
-            help="Higher = more unusual compared to 'normal' historical patterns.",
+    # PAYMENT UI
+    if str(txn_type).upper() == "PAYMENT":
+        st.subheader("PAYMENT — merchant / payment details")
+        payment_category = st.selectbox(
+            "Payment category",
+            ["ecommerce", "utilities", "subscription", "pos", "other"],
+            key=f"pay_cat_{channel_lower}",
+            help="High-level category of the payment.",
+        )
+        merchant_id = st.text_input(
+            "Merchant name / ID",
+            key=f"merchant_{channel_lower}",
+            help="Merchant name or identifier, e.g. Amazon, Store123.",
         )
 
-    st.markdown("### 📦 Model Input Payload")
-    st.json(input_payload)
+        card_used = False
+        card_masked = ""
+        cvv_provided = True
+        device_for_payment = ""
 
-    st.markdown(
-        """
-        ### 🧠 How to interpret this
-        
-        - **Fraud Probability** is learned from historic labeled data (fraud vs non-fraud).
-        - **Anomaly Score** comes from an unsupervised model trained only on normal behavior.
-        - The final **Risk Level** is determined using thresholds calibrated on a validation set.
-        """
+        # For credit/debit card channels, paying by card is implicit
+        if channel_lower in ("credit card", "debit card"):
+            card_used = True
+        else:
+            card_used = st.checkbox(
+                "Paid using card?",
+                value=False,
+                key=f"card_used_{channel_lower}",
+                help="Check if a card (debit/credit) was used for this payment.",
+            )
+
+        if card_used:
+            card_masked = st.text_input(
+                "Card masked (e.g., 4111****1111)",
+                key=f"pay_card_{channel_lower}",
+                help="Masked card number used for the payment.",
+            )
+            cvv_provided = st.checkbox(
+                "CVV provided (checked if present)",
+                value=True,
+                key=f"pay_cvv_{channel_lower}",
+                help="Uncheck only if card was used without CVV (e.g. stored card).",
+            )
+
+        # Device info optional for digital channels
+        if channel_lower in ("mobile app", "online purchase", "netbanking", "credit card", "debit card", "other"):
+            device_for_payment = st.text_input(
+                "Device / Browser (optional)",
+                key=f"pay_device_{channel_lower}",
+                help="Device or browser string, e.g. 'Android Chrome'.",
+            )
+
+        payment_fields.update(
+            {
+                "payment_category": payment_category,
+                "merchant_id": merchant_id,
+                "card_used": bool(card_used),
+                "card_masked": card_masked,
+                "cvv_provided": bool(cvv_provided),
+                "device_info": device_for_payment,
+            }
+        )
+
+    # BILL PAY UI
+    if str(txn_type).upper() == "BILL_PAY":
+        st.subheader("BILL PAY — structured biller details")
+        biller_category = st.selectbox(
+            "Biller category",
+            ["electricity", "water", "telecom", "internet", "insurance", "other"],
+            key=f"biller_cat_{channel_lower}",
+            help="Type of bill being paid.",
+        )
+        biller_id = st.text_input(
+            "Biller ID",
+            key=f"biller_id_{channel_lower}",
+            help="Identifier of the biller, e.g. utility account number.",
+        )
+        bill_reference_number = st.text_input(
+            "Bill/reference number",
+            key=f"bill_ref_{channel_lower}",
+            help="Bill reference or invoice number.",
+        )
+        due_date = st.date_input(
+            "Bill due date (optional)",
+            value=datetime.date.today(),
+            key=f"bill_due_{channel_lower}",
+            help="Due date printed on the bill, if available.",
+        )
+        bill_period_start = st.date_input(
+            "Bill period start (optional)",
+            value=datetime.date.today(),
+            key=f"bill_start_{channel_lower}",
+            help="Start date of the billing period.",
+        )
+        bill_period_end = st.date_input(
+            "Bill period end (optional)",
+            value=datetime.date.today(),
+            key=f"bill_end_{channel_lower}",
+            help="End date of the billing period.",
+        )
+        billpay_fields.update(
+            {
+                "biller_category": biller_category,
+                "biller_id": biller_id,
+                "bill_reference_number": bill_reference_number,
+                "due_date": str(due_date) if due_date else "",
+                "bill_period_start": str(bill_period_start) if bill_period_start else "",
+                "bill_period_end": str(bill_period_end) if bill_period_end else "",
+            }
+        )
+
+    st.markdown("---")
+    st.markdown("#### Channel-specific fields")
+
+    # Branch (Onsite)
+    branch_fields = {}
+    if channel_lower == "onsite branch transaction":
+        st.subheader("Onsite Branch Transaction — Identity verification")
+        id_type = st.selectbox(
+            "ID Document Type",
+            ["", "Passport", "Driver License", "Government ID", "Other"],
+            key="branch_id_type",
+            help="Type of identity document presented.",
+        )
+        id_number = st.text_input(
+            "ID Document Number",
+            key="branch_id_number",
+            help="Identifier printed on the ID document.",
+        )
+        branch = st.text_input(
+            "Branch Name / Code",
+            value="",
+            key="branch_branch",
+            help="Name or internal code of the physical branch.",
+        )
+        teller_id = st.text_input(
+            "Teller ID (optional)",
+            value="",
+            key="branch_teller",
+            help="Internal teller identifier if available.",
+        )
+        branch_fields.update(
+            {"id_type": id_type, "id_number": id_number, "branch": branch, "teller_id": teller_id}
+        )
+
+    # ATM
+    atm_fields = {}
+    if channel_lower == "atm":
+        st.subheader("ATM fields — card + ATM info (no IP/device)")
+        atm_id = st.text_input(
+            "ATM ID / Terminal",
+            key="atm_id",
+            help="Unique ATM or terminal identifier.",
+        )
+        atm_location = st.text_input(
+            "ATM Location (free text)",
+            key="atm_location",
+            help="Human-readable ATM location, e.g. 'Mumbai - Bandra West'.",
+        )
+        atm_distance_km = st.number_input(
+            "ATM distance from last known location (km)",
+            min_value=0.0,
+            value=0.0,
+            step=1.0,
+            key="atm_distance",
+            help="Approximate distance between previous known location and this ATM.",
+        )
+        card_masked_atm = st.text_input(
+            "Card masked (e.g., 4111****1111)",
+            key="atm_card_masked",
+            help="Masked card number used at the ATM.",
+        )
+        atm_fields.update(
+            {
+                "atm_id": atm_id,
+                "atm_location": atm_location,
+                "atm_distance_km": atm_distance_km,
+                "card_masked": card_masked_atm,
+            }
+        )
+
+    # Mobile App
+    mobile_fields = {}
+    if channel_lower == "mobile app":
+        st.subheader("Mobile App fields — device + app telemetry")
+        device = st.text_input(
+            "Device / OS (e.g., Android)",
+            value="Android",
+            key="mobile_device",
+            help="Device family, e.g. 'Android', 'iOS'.",
+        )
+        device_fingerprint = st.text_input(
+            "Device fingerprint (optional)",
+            key="mobile_device_fp",
+            help="Hashed device fingerprint or identifier.",
+        )
+        app_version = st.text_input(
+            "App version",
+            value="1.0.0",
+            key="mobile_app_ver",
+            help="Version of the mobile application.",
+        )
+        last_device = st.text_input(
+            "Last known device (optional)",
+            key="mobile_last_device",
+            help="Device ID used in previous sessions, if recorded.",
+        )
+        mobile_fields.update(
+            {
+                "DeviceID": device,
+                "device_fingerprint": device_fingerprint,
+                "app_version": app_version,
+                "device_last_seen": last_device,
+            }
+        )
+
+    # Credit Card / Debit Card
+    card_fields = {}
+    if channel_lower in ("credit card", "debit card"):
+        st.subheader(f"{channel} details")
+        mode_label = "Credit/Debit Card mode"
+        cc_mode = st.radio(
+            mode_label,
+            ["POS (physical)", "Mobile/Web (app or web)"],
+            key=f"card_mode_{channel_lower}",
+            help="Was the card used physically at POS, or via app/web?",
+        )
+        if cc_mode == "POS (physical)":
+            card_masked_cc = st.text_input(
+                "Card masked (4111****1111)",
+                key=f"{channel_lower}_pos_card",
+                help="Masked card number used at POS.",
+            )
+            card_country = st.text_input(
+                "Card issuing country",
+                key=f"{channel_lower}_pos_country",
+                help="Country where the card was issued, e.g. 'India'.",
+            )
+            cvv_provided = st.checkbox(
+                "CVV provided (checked if present)",
+                value=True,
+                key=f"{channel_lower}_pos_cvv",
+                help="Was the CVV available for this transaction?",
+            )
+            pos_merchant_id = st.text_input(
+                "POS Merchant ID (optional)",
+                key=f"{channel_lower}_pos_mid",
+                help="Merchant ID of the POS terminal.",
+            )
+            card_fields.update(
+                {
+                    "card_masked": card_masked_cc,
+                    "card_country": card_country,
+                    "cvv_provided": cvv_provided,
+                    "pos_merchant_id": pos_merchant_id,
+                }
+            )
+        else:
+            card_masked_cc = st.text_input(
+                "Card masked (4111****1111)",
+                key=f"{channel_lower}_web_card",
+                help="Masked card number used online.",
+            )
+            card_country = st.text_input(
+                "Card issuing country",
+                key=f"{channel_lower}_web_country",
+                help="Country where the card was issued.",
+            )
+            cvv_provided = st.checkbox(
+                "CVV provided (checked if present)",
+                value=True,
+                key=f"{channel_lower}_web_cvv",
+                help="Was CVV provided as part of the online transaction?",
+            )
+            device_cc = st.text_input(
+                "Device / Browser (optional)",
+                key=f"{channel_lower}_web_device",
+                help="Device or browser user-agent string.",
+            )
+            device_fingerprint_cc = st.text_input(
+                "Device fingerprint (optional)",
+                key=f"{channel_lower}_web_fp",
+                help="Hashed device fingerprint.",
+            )
+            last_device_cc = st.text_input(
+                "Last known device (optional)",
+                key=f"{channel_lower}_web_last_device",
+                help="Device identifier observed in previous sessions.",
+            )
+            card_fields.update(
+                {
+                    "card_masked": card_masked_cc,
+                    "card_country": card_country,
+                    "cvv_provided": cvv_provided,
+                    "DeviceID": device_cc,
+                    "device_fingerprint": device_fingerprint_cc,
+                    "device_last_seen": last_device_cc,
+                }
+            )
+
+    # POS
+    pos_fields = {}
+    if channel_lower == "pos":
+        st.subheader("POS fields")
+        pos_merchant_id = st.text_input(
+            "POS Merchant ID",
+            key="pos_mid",
+            help="Merchant ID or terminal ID of the POS device.",
+        )
+        store_name = st.text_input(
+            "Store name",
+            key="pos_store",
+            help="Name of the physical store.",
+        )
+        pos_repeat_count = st.number_input(
+            "Rapid repeat transactions at same POS",
+            min_value=0,
+            value=0,
+            step=1,
+            key="pos_repeat",
+            help="Number of back-to-back transactions at the same POS.",
+        )
+        pos_fields.update(
+            {
+                "pos_merchant_id": pos_merchant_id,
+                "store_name": store_name,
+                "pos_repeat_count": pos_repeat_count,
+            }
+        )
+
+    # Online Purchase
+    online_fields = {}
+    if channel_lower == "online purchase":
+        st.subheader("Online Purchase fields (device + addresses)")
+        merchant = st.text_input(
+            "Merchant name / ID",
+            key="online_merchant",
+            help="Online merchant name or ID.",
+        )
+        shipping_address = st.text_input(
+            "Shipping address",
+            key="online_ship",
+            help="Full shipping address, e.g. 'Flat 101, Mumbai, India'.",
+        )
+        billing_address = st.text_input(
+            "Billing address",
+            value=shipping_address,
+            key="online_bill",
+            help="Billing address; prefilled with shipping address by default.",
+        )
+        used_card_online = st.checkbox(
+            "Paid by card online?",
+            value=False,
+            key="online_card_used",
+            help="Check if a card was used to pay online.",
+        )
+        card_masked_online = ""
+        cvv_provided_online = True
+        if used_card_online:
+            cvv_provided_online = st.checkbox(
+                "CVV provided (checked if present)",
+                value=True,
+                key="online_cvv",
+                help="Uncheck only if CVV was not required.",
+            )
+            card_masked_online = st.text_input(
+                "Card masked",
+                key="online_card_masked",
+                help="Masked card number used online.",
+            )
+        device_online = st.text_input(
+            "Device / Browser (optional)",
+            key="online_device",
+            help="Device or browser user-agent string.",
+        )
+        last_device_online = st.text_input(
+            "Last known device (optional)",
+            key="online_last_device",
+            help="Device identifier observed in previous online sessions.",
+        )
+        online_fields.update(
+            {
+                "merchant": merchant,
+                "shipping_address": shipping_address,
+                "billing_address": billing_address,
+                "card_masked": card_masked_online,
+                "cvv_provided": cvv_provided_online,
+                "DeviceID": device_online,
+                "device_last_seen": last_device_online,
+            }
+        )
+
+    # NetBanking
+    netbanking_fields = {}
+    if channel_lower == "netbanking":
+        st.subheader("NetBanking fields (device-aware)")
+        username = st.text_input(
+            "User ID / Login",
+            key="nb_user",
+            help="NetBanking user login or customer ID.",
+        )
+        device = st.text_input(
+            "Device / Browser (used to login)",
+            key="nb_device",
+            help="Device or browser used for NetBanking login.",
+        )
+        last_device = st.text_input(
+            "Last known device (optional)",
+            key="nb_last_device",
+            help="Device used in previous NetBanking sessions.",
+        )
+        beneficiary = st.text_input(
+            "Beneficiary (if transfer)",
+            key="nb_beneficiary",
+            help="Primary beneficiary name or identifier.",
+        )
+        netbanking_fields.update(
+            {
+                "username": username,
+                "DeviceID": device,
+                "device_last_seen": last_device,
+                "beneficiary": beneficiary,
+            }
+        )
+
+    # Other
+    other_fields = {}
+    if channel_lower == "other":
+        st.subheader("Other channel — generic transaction data")
+        description = st.text_area(
+            "Transaction description / remarks",
+            key="other_desc",
+            help="Any free-text notes describing this transaction.",
+        )
+        other_fields.update({"description": description})
+
+    # Optional telemetry panel
+    st.markdown("#### Optional telemetry (helps rules; provide if available)")
+    colT1, colT2 = st.columns(2)
+    with colT1:
+        monthly_avg = st.number_input(
+            f"Customer monthly average spend ({currency})",
+            min_value=0.0,
+            value=10000.0,
+            step=100.0,
+            key=f"monthly_avg_{channel_lower}",
+            help="Average monthly outgoing amount across all channels.",
+        )
+        rolling_avg_7d = st.number_input(
+            f"7-day rolling average ({currency})",
+            min_value=0.0,
+            value=3000.0,
+            step=50.0,
+            key=f"rolling_avg_{channel_lower}",
+            help="Average outgoing amount in the last 7 days.",
+        )
+        txns_last_1h = st.number_input(
+            "Transactions in last 1 hour",
+            min_value=0,
+            value=0,
+            step=1,
+            key=f"txns1h_{channel_lower}",
+            help="Total number of transactions across all channels in last 60 minutes.",
+        )
+        txns_last_24h = st.number_input(
+            "Transactions in last 24 hours",
+            min_value=0,
+            value=0,
+            step=1,
+            key=f"txns24h_{channel_lower}",
+            help="Total number of transactions in the last 24 hours.",
+        )
+    with colT2:
+        txns_last_7d = st.number_input(
+            "Transactions in last 7 days",
+            min_value=0,
+            value=7,
+            step=1,
+            key=f"txns7d_{channel_lower}",
+            help="Total number of transactions in the last 7 days.",
+        )
+        beneficiaries_added_24h = st.number_input(
+            "Beneficiaries added in last 24h",
+            min_value=0,
+            value=0,
+            step=1,
+            key=f"ben24_{channel_lower}",
+            help="Number of new beneficiaries created in last 24 hours.",
+        )
+        beneficiaries_added_24h = int(beneficiaries_added_24h)
+        failed_login_attempts = st.number_input(
+            "Failed login attempts (recent)",
+            min_value=0,
+            value=0,
+            step=1,
+            key=f"failed_{channel_lower}",
+            help="Count of failed authentication attempts in the recent window.",
+        )
+
+    # IP & Geo telemetry (centralized)
+    st.markdown("#### IP / Geo (centralized fields)")
+
+    home_city = st.text_input(
+        "Customer home city",
+        key=f"home_city_{channel_lower}",
+        help="Customer’s usual residential city, e.g. 'Bangalore'.",
     )
+    home_country = st.text_input(
+        "Customer home country",
+        key=f"home_country_{channel_lower}",
+        help="Customer’s KYC country of residence, e.g. 'India'.",
+    )
+
+    if channel_lower in ("onsite branch transaction", "atm"):
+        st.info("Onsite/ATM: client IP is not collected by design for in-branch and ATM flows.")
+        client_ip = ""
+        ip_country = ""
+        suspicious_ip_flag = False
+    else:
+        client_ip = st.text_input(
+            "Client IP (optional)",
+            key=f"client_ip_{channel_lower}",
+            help="IP address as seen by the front-end channel.",
+        )
+        ip_country = st.text_input(
+            "IP country (optional)",
+            key=f"ip_country_{channel_lower}",
+            help="Country inferred from client IP, e.g. 'India'.",
+        )
+        suspicious_ip_flag = st.checkbox(
+            "IP flagged by threat intel?",
+            value=False,
+            key=f"suspicious_{channel_lower}",
+            help="Check if IP appears in any threat intelligence list.",
+        )
+
+    txn_location_ip = st.text_input(
+        "Transaction origin IP (txn_location_ip) (optional)",
+        key=f"txn_loc_ip_{channel_lower}",
+        help="IP used to initiate the transaction.",
+    )
+    txn_city = st.text_input(
+        "Transaction city (txn_city)",
+        key=f"txn_city_{channel_lower}",
+        help="City where the transaction originates (terminal/app).",
+    )
+    txn_country = st.text_input(
+        "Transaction country (txn_country)",
+        key=f"txn_country_{channel_lower}",
+        help="Country where the transaction originates.",
+    )
+
+    # Lat/long optional for distance/impossible-travel checks
+    last_known_lat = st.number_input(
+        "Last known latitude (optional)",
+        format="%.6f",
+        value=0.0,
+        key=f"lastlat_{channel_lower}",
+        help="Latitude from previous session or transaction, if available.",
+    )
+    last_known_lon = st.number_input(
+        "Last known longitude (optional)",
+        format="%.6f",
+        value=0.0,
+        key=f"lastlon_{channel_lower}",
+        help="Longitude from previous session or transaction, if available.",
+    )
+    txn_lat = st.number_input(
+        "Transaction latitude (optional)",
+        format="%.6f",
+        value=0.0,
+        key=f"txnlat_{channel_lower}",
+        help="Latitude where current transaction originates.",
+    )
+    txn_lon = st.number_input(
+        "Transaction longitude (optional)",
+        format="%.6f",
+        value=0.0,
+        key=f"txnon_{channel_lower}",
+        help="Longitude where current transaction originates.",
+    )
+
+    last_known_lat = last_known_lat if last_known_lat != 0.0 else None
+    last_known_lon = last_known_lon if last_known_lon != 0.0 else None
+    txn_lat = txn_lat if txn_lat != 0.0 else None
+    txn_lon = txn_lon if txn_lon != 0.0 else None
+
+    # Submit
+    submit = st.button("🚀 Run Fraud Check", key=f"submit_{channel_lower}")
+
+    if submit:
+        # Measure response time from here
+        start_time = time.perf_counter()
+
+        payload: Dict = {
+            "Amount": amount,
+            "Currency": currency,
+            "TransactionType": txn_type,
+            "Channel": channel,
+            "hour": hour,
+            "day_of_week": day_of_week,
+            "month": month,
+            # telemetry
+            "monthly_avg": monthly_avg,
+            "rolling_avg_7d": rolling_avg_7d,
+            "txns_last_1h": int(txns_last_1h),
+            "txns_last_24h": int(txns_last_24h),
+            "txns_last_7d": int(txns_last_7d),
+            "beneficiaries_added_24h": int(beneficiaries_added_24h),
+            "failed_login_attempts": int(failed_login_attempts),
+            # centralized ip/geo
+            "client_ip": client_ip,
+            "ip_country": ip_country,
+            "txn_location_ip": txn_location_ip,
+            "txn_city": txn_city,
+            "txn_country": txn_country,
+            "home_city": home_city,
+            "home_country": home_country,
+            "declared_country": home_country,  # treat KYC/home as declared country
+            "suspicious_ip_flag": suspicious_ip_flag,
+            "last_known_lat": last_known_lat,
+            "last_known_lon": last_known_lon,
+            "txn_lat": txn_lat,
+            "txn_lon": txn_lon,
+        }
+
+        # attach transaction-type specific details
+        payload.update(transfer_fields)
+        if str(txn_type).upper() == "PAYMENT":
+            payload.update(payment_fields)
+        elif str(txn_type).upper() == "BILL_PAY":
+            payload.update(billpay_fields)
+
+        # attach channel-specific details
+        if channel_lower == "onsite branch transaction":
+            payload.update(branch_fields)
+        elif channel_lower == "atm":
+            payload.update(atm_fields)
+        elif channel_lower == "mobile app":
+            payload.update(mobile_fields)
+        elif channel_lower in ("credit card", "debit card"):
+            payload.update(card_fields)
+        elif channel_lower == "pos":
+            payload.update(pos_fields)
+        elif channel_lower == "online purchase":
+            payload.update(online_fields)
+        elif channel_lower == "netbanking":
+            payload.update(netbanking_fields)
+        elif channel_lower == "other":
+            payload.update(other_fields)
+
+        convert_to_inr_for_model = False
+
+        with st.spinner("Scoring with ML models..."):
+            (
+                fraud_prob_raw,
+                anomaly_raw,
+                fraud_score,
+                anomaly_score,
+                ml_label,
+            ) = score_transaction_ml(
+                supervised_pipeline,
+                iforest_pipeline,
+                payload,
+                convert_to_inr=convert_to_inr_for_model,
+                currency=currency,
+            )
+
+        rules_triggered, rules_highest = evaluate_rules(payload, currency)
+
+        final_risk = combine_final_risk(ml_label, rules_highest)
+
+        end_time = time.perf_counter()
+        response_time_s = end_time - start_time
+
+        # ---------------- Results UI ----------------
+        st.markdown("## 🔎 Results")
+        color_map = {
+            "LOW": "#2e7d32",
+            "MEDIUM": "#f9a825",
+            "HIGH": "#f57c00",
+            "CRITICAL": "#c62828",
+        }
+        badge_color = color_map.get(final_risk, "#607d8b")
+        st.markdown(
+            f"""<div style="padding:0.75rem 1rem;border-radius:0.5rem;background-color:{badge_color}22;border:1px solid {badge_color};">
+                <strong style="color:{badge_color};font-size:1.1rem;">Final Risk Level: {final_risk}</strong>
+            </div>""",
+            unsafe_allow_html=True,
+        )
+
+        colA, colB, colC = st.columns(3)
+        with colA:
+            st.metric(
+                "Fraud Risk Score (0–100)",
+                f"{fraud_score:.1f}",
+                help="Calibrated fraud risk score derived from supervised ML probability (with beneficiary impact).",
+            )
+            st.metric("ML Risk Label", ml_label)
+        with colB:
+            st.metric(
+                "Anomaly Risk Score (0–100)",
+                f"{anomaly_score:.1f}",
+                help="Calibrated anomaly risk score derived from IsolationForest.",
+            )
+            st.metric("Rules-derived highest severity", rules_highest)
+        with colC:
+            st.metric(
+                "Response time (seconds)",
+                f"{response_time_s:.3f}",
+                help="End-to-end scoring time for this transaction.",
+            )
+
+        st.markdown("### 🧠 ML & Rules Justification")
+        explanation_bullets = build_explanation(
+            payload,
+            fraud_score,
+            anomaly_score,
+            ml_label,
+            rules_triggered,
+            final_risk,
+        )
+        for line in explanation_bullets:
+            st.markdown(f"- {line}")
+
+        st.markdown("### ⚠ Triggered Rules (detailed)")
+        if rules_triggered:
+            for r in rules_triggered:
+                sev = r["severity"]
+                emoji = "🔴" if sev in ("HIGH", "CRITICAL") else "🟠" if sev == "MEDIUM" else "🟢"
+                st.write(f"{emoji} **{r['name']}** — *{r['severity']}*")
+                st.caption(r["detail"])
+        else:
+            st.success("No deterministic rules triggered.")
+
+        st.markdown("### 📦 Payload (debug)")
+        st.json(payload)
+
+        # Examples section for KT
+        with st.expander("📚 Example good & fraud transactions for this channel"):
+            ch_df = EXAMPLE_TXNS_DF[EXAMPLE_TXNS_DF["channel"] == channel_lower]
+            good_df = ch_df[ch_df["example_type"] == "GOOD"]
+            fraud_df = ch_df[ch_df["example_type"] == "FRAUD"]
+
+            st.markdown("**Good / genuine transactions (examples)**")
+            st.dataframe(
+                good_df[
+                    [
+                        "transaction_type",
+                        "amount_in_inr",
+                        "fraud_confidence_ml_pct",
+                        "anomaly_score_ml_pct",
+                        "final_risk",
+                    ]
+                ]
+            )
+            st.markdown("**Fraud / suspicious transactions (examples)**")
+            st.dataframe(
+                fraud_df[
+                    [
+                        "transaction_type",
+                        "amount_in_inr",
+                        "fraud_confidence_ml_pct",
+                        "anomaly_score_ml_pct",
+                        "final_risk",
+                    ]
+                ]
+            )
+
 else:
-    st.info("Fill the form above and click **Run Fraud Check** to score a transaction.")
+    st.info(
+        "Select currency, enter amount/date/time, then pick a channel to show channel-specific inputs."
+    )
