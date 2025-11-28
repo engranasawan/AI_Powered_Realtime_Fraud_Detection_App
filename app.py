@@ -1089,30 +1089,30 @@ if channel_display and channel_display != "Choose...":
     # -------------------
 # UPI CHANNEL FIELDS
 # -------------------
-upi_fields = {}
-if channel_lower == "upi":
-    st.subheader("UPI Fields")
-    upi_id = st.text_input(
-        "UPI ID (e.g., username@bank)",
-        key="upi_id",
-        help="The sender’s UPI virtual payment address."
-    )
-    merchant_upi = st.text_input(
-        "Merchant / Recipient UPI ID",
-        key="upi_merchant",
-        help="The recipient’s UPI virtual address."
-    )
-    device_upi = st.text_input(
-        "Device / App (optional)",
-        key="upi_device",
-        help="App/device used for UPI payment, e.g. GPay / PhonePe."
-    )
+    upi_fields = {}
+    if channel_lower == "upi":
+        st.subheader("UPI Fields")
+        upi_id = st.text_input(
+            "UPI ID (e.g., username@bank)",
+            key="upi_id",
+            help="The sender’s UPI virtual payment address."
+        )
+        merchant_upi = st.text_input(
+            "Merchant / Recipient UPI ID",
+            key="upi_merchant",
+            help="The recipient’s UPI virtual address."
+        )
+        device_upi = st.text_input(
+            "Device / App (optional)",
+            key="upi_device",
+            help="App/device used for UPI payment, e.g. GPay / PhonePe."
+        )    
 
-    upi_fields.update({
-        "upi_id": upi_id,
-        "merchant_upi": merchant_upi,
-        "DeviceID": device_upi,
-    })
+        upi_fields.update({
+            "upi_id": upi_id,
+            "merchant_upi": merchant_upi,
+            "DeviceID": device_upi,
+        })
 
     # Credit Card
     cc_fields: Dict = {}
