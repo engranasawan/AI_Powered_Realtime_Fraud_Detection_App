@@ -624,8 +624,7 @@ if channel == "upi":
     highest = "LOW"
     for r in rules:
         highest = escalate(highest, r["severity"])
-
-return rules, highest
+    return rules, highest
 
 # -------------------------
 # Combine final risk
