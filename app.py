@@ -578,6 +578,8 @@ if channel == "upi":
                 "Transfer missing source or destination account details.",
             )
 
+
+
     # 23) Onsite branch transactions without identity
     if channel == "bank":
         if not id_type or not id_number:
@@ -607,6 +609,7 @@ if channel == "upi":
             "MEDIUM",
             "IP appears to belong to a cloud hosting provider, not a residential ISP.",
         )
+
     if ip_risk_score >= 80:
         add_rule(
             "High IP reputation risk score",
@@ -624,7 +627,9 @@ if channel == "upi":
     highest = "LOW"
     for r in rules:
         highest = escalate(highest, r["severity"])
+
     return rules, highest
+
 
 # -------------------------
 # Combine final risk
