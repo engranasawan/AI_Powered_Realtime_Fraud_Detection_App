@@ -370,20 +370,20 @@ def evaluate_rules(payload: Dict, currency: str) -> Tuple[List[Dict], str]:
     ip_risk_score = int(payload.get("ip_risk_score", 0) or 0)
 
     # UPI-specific rules
-if channel == "upi":
-    if amt >= MED_AMT and new_benef:
-        add_rule(
-            "UPI payment to newly added payee",
-            "HIGH",
-            "UPI transfer to an untrusted/new VPA with significant amount."
-        )
+    if channel == "upi":
+        if amt >= MED_AMT and new_benef:
+            add_rule(
+                "UPI payment to newly added payee",
+                "HIGH",
+                "UPI transfer to an untrusted/new VPA with significant amount."
+            )
 
-    if txns_1h >= 5:
-        add_rule(
-            "UPI rapid transactions",
-            "MEDIUM",
-            f"{txns_1h} UPI transactions within 1 hour."
-        )
+        if txns_1h >= 5:
+            add_rule(
+                "UPI rapid transactions",
+                "MEDIUM",
+                f"{txns_1h} UPI transactions within 1 hour."
+            )
 
 
     def add_rule(name: str, sev: str, detail: str):
