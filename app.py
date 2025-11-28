@@ -84,48 +84,7 @@ CHANNEL_DISPLAY_TO_CANONICAL = {
     "Other": "Other",
 }
 
-# -------------------------
-# Example transactions (for KT; static)
-# -------------------------
-def build_example_transactions() -> pd.DataFrame:
-    """
-    Build a small synthetic table of example transactions per channel.
-    These are illustrative only – not from the real model.
-    """
-    rows = []
-    for channel_key, txn_types in CHANNEL_TXN_TYPES.items():
-        # use canonical channel key as identifier in examples
-        for i in range(5):
-            rows.append(
-                {
-                    "channel": channel_key,
-                    "example_type": "GOOD",
-                    "transaction_type": txn_types[i % len(txn_types)],
-                    "amount_in_inr": 5_000 + i * 2_000,
-                    "fraud_confidence_ml_pct": 0.5 + i * 0.3,  # illustrative only
-                    "anomaly_score_ml_pct": 0.2 + i * 0.2,
-                    "rules_risk": "LOW",
-                    "final_risk": "LOW",
-                }
-            )
-        for i in range(5):
-            rows.append(
-                {
-                    "channel": channel_key,
-                    "example_type": "FRAUD",
-                    "transaction_type": txn_types[i % len(txn_types)],
-                    "amount_in_inr": 200_000 + i * 500_000,
-                    "fraud_confidence_ml_pct": 60 + i * 8,
-                    "anomaly_score_ml_pct": 40 + i * 5,
-                    "rules_risk": "HIGH" if i < 3 else "CRITICAL",
-                    "final_risk": "HIGH" if i < 3 else "CRITICAL",
-                }
-            )
-    df = pd.DataFrame(rows)
-    return df
 
-
-EXAMPLE_TXNS_DF = build_example_transactions()
 
 # -------------------------
 # HELPERS
@@ -1774,37 +1733,7 @@ if channel_display and channel_display != "Choose...":
         st.markdown("### 📦 Payload (debug)")
         st.json(payload)
 
-        # Examples section for KT
-        with st.expander("📚 Example good & fraud transactions for this channel"):
-            ch_key = channel_lower
-            ch_df = EXAMPLE_TXNS_DF[EXAMPLE_TXNS_DF["channel"] == ch_key]
-            good_df = ch_df[ch_df["example_type"] == "GOOD"]
-            fraud_df = ch_df[ch_df["example_type"] == "FRAUD"]
-
-            st.markdown("**Good / genuine transactions (examples)**")
-            st.dataframe(
-                good_df[
-                    [
-                        "transaction_type",
-                        "amount_in_inr",
-                        "fraud_confidence_ml_pct",
-                        "anomaly_score_ml_pct",
-                        "final_risk",
-                    ]
-                ]
-            )
-            st.markdown("**Fraud / suspicious transactions (examples)**")
-            st.dataframe(
-                fraud_df[
-                    [
-                        "transaction_type",
-                        "amount_in_inr",
-                        "fraud_confidence_ml_pct",
-                        "anomaly_score_ml_pct",
-                        "final_risk",
-                    ]
-                ]
-            )
+        
 
 else:
     st.info(
