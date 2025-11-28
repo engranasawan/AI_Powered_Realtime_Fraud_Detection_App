@@ -10,6 +10,22 @@
 # - Aadhaar as identity type
 # - Beneficiary type as mutually exclusive options
 # - Additional channels: Debit Card, Other
+st.markdown(
+    """
+    <style>
+        /* Make entire app scrollable properly on Mac */
+        .main, .block-container {
+            overflow-y: auto !important;
+            max-height: 100vh !important;
+        }
+        /* Prevent inputs from growing out of screen */
+        .stTextInput, .stSelectbox, .stNumberInput {
+            overflow: visible !important;
+        }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
 
 import datetime
 import time  # used for response-time measurement
@@ -65,6 +81,7 @@ CHANNEL_TXN_TYPES = {
     "online purchase": ["PAYMENT"],
     "bank": ["DEPOSIT", "TRANSFER", "WITHDRAWAL"],
     "netbanking": ["TRANSFER", "BILL_PAY", "PAYMENT"],
+    "upi": ["PAYMENT", "TRANSFER"],
     "other": ["PAYMENT", "TRANSFER", "BILL_PAY", "OTHER"],
 }
 
@@ -78,6 +95,7 @@ CHANNEL_DISPLAY_TO_CANONICAL = {
     "POS": "POS",
     "Online Purchase": "Online Purchase",
     "NetBanking": "NetBanking",
+    "UPI": "UPI",
     "Other": "Other",
 }
 
@@ -350,6 +368,23 @@ def evaluate_rules(payload: Dict, currency: str) -> Tuple[List[Dict], str]:
     tor_exit_node = bool(payload.get("tor_exit_node", False))
     cloud_host_ip = bool(payload.get("cloud_host_ip", False))
     ip_risk_score = int(payload.get("ip_risk_score", 0) or 0)
+
+    # UPI-specific rules
+if channel == "upi":
+    if amt >= MED_AMT and new_benef:
+        add_rule(
+            "UPI payment to newly added payee",
+            "HIGH",
+            "UPI transfer to an untrusted/new VPA with significant amount."
+        )
+
+    if txns_1h >= 5:
+        add_rule(
+            "UPI rapid transactions",
+            "MEDIUM",
+            f"{txns_1h} UPI transactions within 1 hour."
+        )
+
 
     def add_rule(name: str, sev: str, detail: str):
         rules.append({"name": name, "severity": sev, "detail": detail})
@@ -1062,6 +1097,33 @@ if channel_display and channel_display != "Choose...":
                 "device_last_seen": last_device,
             }
         )
+    # -------------------
+# UPI CHANNEL FIELDS
+# -------------------
+upi_fields = {}
+if channel_lower == "upi":
+    st.subheader("UPI Fields")
+    upi_id = st.text_input(
+        "UPI ID (e.g., username@bank)",
+        key="upi_id",
+        help="The sender’s UPI virtual payment address."
+    )
+    merchant_upi = st.text_input(
+        "Merchant / Recipient UPI ID",
+        key="upi_merchant",
+        help="The recipient’s UPI virtual address."
+    )
+    device_upi = st.text_input(
+        "Device / App (optional)",
+        key="upi_device",
+        help="App/device used for UPI payment, e.g. GPay / PhonePe."
+    )
+
+    upi_fields.update({
+        "upi_id": upi_id,
+        "merchant_upi": merchant_upi,
+        "DeviceID": device_upi,
+    })
 
     # Credit Card
     cc_fields: Dict = {}
@@ -1634,6 +1696,8 @@ if channel_display and channel_display != "Choose...":
             payload.update(online_fields)
         elif channel_lower == "netbanking":
             payload.update(netbanking_fields)
+        elif channel_lower == "upi":
+            payload.update(upi_fields)
         elif channel_lower == "other":
             payload.update(other_fields)
 
