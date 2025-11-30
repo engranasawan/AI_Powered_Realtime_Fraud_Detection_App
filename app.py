@@ -1815,19 +1815,3 @@ else:
         "Select currency, enter amount/date/time, then pick a channel to show channel-specific inputs."
     )
 
-st.markdown(
-    """
-    <style>
-        /* Make entire app scrollable properly on Mac */
-        .main, .block-container {
-            overflow-y: auto !important;
-            max-height: 100vh !important;
-        }
-        /* Prevent inputs from growing out of screen */
-        .stTextInput, .stSelectbox, .stNumberInput {
-            overflow: visible !important;
-        }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
